@@ -41,7 +41,7 @@ mod tests {
     #[tokio::test]
     async fn replace_overwrites_an_existing_destination() -> anyhow::Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "clash-verge-service-atomic-replace-{}",
+            "clash-service-atomic-replace-{}",
             std::process::id()
         ));
         let source = root.join("state.json.tmp");

@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::path::Path;
 
 #[cfg(unix)]
-pub(crate) const SYNTHETIC_TEST_OWNER_TOKEN_PREFIX: &str = "clash-verge-service-test-owner:";
+pub(crate) const SYNTHETIC_TEST_OWNER_TOKEN_PREFIX: &str = "clash-service-test-owner:";
 
 pub fn test_owner_credentials(app_data_root: &Path) -> Result<OwnerCredentials> {
     std::fs::create_dir_all(app_data_root)?;

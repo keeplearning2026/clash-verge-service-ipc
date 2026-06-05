@@ -13,12 +13,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-fn enter_repair_gate() -> Result<clash_verge_service_ipc::ServiceRepairGate, Error> {
-    match clash_verge_service_ipc::acquire_service_repair_gate()? {
+fn enter_repair_gate() -> Result<clash_service_ipc::ServiceRepairGate, Error> {
+    match clash_service_ipc::acquire_service_repair_gate()? {
         Some(gate) => Ok(gate),
         None => {
             eprintln!("Service repair is already in progress");
-            std::process::exit(clash_verge_service_ipc::REPAIR_IN_PROGRESS_EXIT_CODE);
+            std::process::exit(clash_service_ipc::REPAIR_IN_PROGRESS_EXIT_CODE);
         }
     }
 }
@@ -161,7 +161,7 @@ fn wait_for_service_ready() -> Result<(), Error> {
         .build()
         .context("failed to create service readiness runtime")?;
     runtime.block_on(async {
-        clash_verge_service_ipc::set_config(Some(clash_verge_service_ipc::IpcConfig {
+        clash_service_ipc::set_config(Some(clash_service_ipc::IpcConfig {
             default_timeout: Duration::from_millis(250),
             max_retries: 1,
             retry_delay: Duration::from_millis(25),
@@ -170,12 +170,12 @@ fn wait_for_service_ready() -> Result<(), Error> {
 
         let deadline = Instant::now() + READY_TIMEOUT;
         let result = loop {
-            if let Ok(response) = clash_verge_service_ipc::get_version().await
+            if let Ok(response) = clash_service_ipc::get_version().await
                 && response.code == 0
                 && response.data.is_some_and(|info| {
                     info.supports_client(
-                        clash_verge_service_ipc::ProtocolVersion::current(),
-                        clash_verge_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
+                        clash_service_ipc::ProtocolVersion::current(),
+                        clash_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
                     )
                 })
             {
@@ -189,14 +189,14 @@ fn wait_for_service_ready() -> Result<(), Error> {
             tokio::time::sleep(READY_INTERVAL).await;
         };
 
-        clash_verge_service_ipc::set_config(None).await;
+        clash_service_ipc::set_config(None).await;
         result
     })
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn launchd_service_target() -> String {
-    format!("system/{}", clash_verge_service_ipc::MACOS_SERVICE_ID)
+    format!("system/{}", clash_service_ipc::MACOS_SERVICE_ID)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -247,7 +247,7 @@ fn run_maintenance_if_requested() -> Result<bool, Error> {
     if !std::env::args().any(|argument| argument == "--cleanup-stale-owners") {
         return Ok(false);
     }
-    let removed = clash_verge_service_ipc::cleanup_stale_owner_state()?;
+    let removed = clash_service_ipc::cleanup_stale_owner_state()?;
     println!("Removed {} stale owner state directories", removed.len());
     Ok(true)
 }
@@ -261,7 +261,7 @@ fn env_u32(key: &str) -> Option<u32> {
 fn resolve_service_group_name() -> Result<String, Error> {
     use nix::unistd::{Gid, Group, Uid, User};
 
-    if let Some(gid) = env_u32("CLASH_VERGE_SERVICE_GID")
+    if let Some(gid) = env_u32("CLASH_SERVICE_GID")
         && let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid))
     {
         return Ok(group.name);
@@ -294,10 +294,8 @@ fn main() -> Result<(), Error> {
     let service_binary_path = bundled_service_binary()?;
 
     // 定义 bundle 路径
-    let bundle_path = PathBuf::from("/Library/PrivilegedHelperTools").join(format!(
-        "{}.bundle",
-        clash_verge_service_ipc::MACOS_SERVICE_ID
-    ));
+    let bundle_path = PathBuf::from("/Library/PrivilegedHelperTools")
+        .join(format!("{}.bundle", clash_service_ipc::MACOS_SERVICE_ID));
     let contents_path = bundle_path.join("Contents");
     let macos_path = contents_path.join("MacOS");
 
@@ -320,22 +318,19 @@ fn main() -> Result<(), Error> {
     }
 
     // 创建并写入 launchd plist
-    let plist_file = plist_dir.join(format!(
-        "{}.plist",
-        clash_verge_service_ipc::MACOS_SERVICE_ID
-    ));
+    let plist_file = plist_dir.join(format!("{}.plist", clash_service_ipc::MACOS_SERVICE_ID));
 
     let launchd_plist_content = format!(
         include_str!("../../resources/launchd.plist.tmpl"),
         group_name = resolve_service_group_name()?,
-        service_id = clash_verge_service_ipc::MACOS_SERVICE_ID,
-        app_bundle_id = clash_verge_service_ipc::MACOS_APP_BUNDLE_ID,
+        service_id = clash_service_ipc::MACOS_SERVICE_ID,
+        app_bundle_id = clash_service_ipc::MACOS_APP_BUNDLE_ID,
         service_binary = target_binary_path.to_string_lossy(),
     );
     let info_plist_content = format!(
         include_str!("../../resources/info.plist.tmpl"),
-        display_name = clash_verge_service_ipc::SERVICE_DISPLAY_NAME,
-        service_id = clash_verge_service_ipc::MACOS_SERVICE_ID,
+        display_name = clash_service_ipc::SERVICE_DISPLAY_NAME,
+        service_id = clash_service_ipc::MACOS_SERVICE_ID,
     );
     let plist_path = plist_file.to_string_lossy().into_owned();
     let target_path = target_binary_path.to_string_lossy().into_owned();
@@ -370,7 +365,7 @@ fn main() -> Result<(), Error> {
     run_command("launchctl", &["bootstrap", "system", &plist_path], debug)?;
     run_command(
         "launchctl",
-        &["start", clash_verge_service_ipc::MACOS_SERVICE_ID],
+        &["start", clash_service_ipc::MACOS_SERVICE_ID],
         debug,
     )?;
     wait_for_service_ready()?;
@@ -388,10 +383,10 @@ fn main() -> Result<(), Error> {
     let _gate = enter_repair_gate()?;
     let debug = std::env::args().any(|arg| arg == "--debug");
     let source = bundled_service_binary()?;
-    let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
+    let install_dir = clash_service_ipc::prepare_service_install_directory()?;
     let target = install_dir.join("clash-service");
     let staged = stage_service_binary(&source, &target)?;
-    let unit_name = format!("{}.service", clash_verge_service_ipc::SERVICE_SLUG);
+    let unit_name = format!("{}.service", clash_service_ipc::SERVICE_SLUG);
     let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
 
     let _ = run_command("systemctl", &["stop", &unit_name], debug);
@@ -401,7 +396,7 @@ fn main() -> Result<(), Error> {
         include_str!("../../resources/systemd_service_unit.tmpl"),
         exec_start = target.to_string_lossy(),
         group = resolve_service_group_name()?,
-        runtime_directory = clash_verge_service_ipc::SERVICE_SLUG,
+        runtime_directory = clash_service_ipc::SERVICE_SLUG,
     );
 
     let mut unit_file = File::create(&unit_path)
@@ -440,7 +435,7 @@ fn main() -> anyhow::Result<()> {
     }
     let _gate = enter_repair_gate()?;
     let source = bundled_service_binary()?;
-    let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
+    let install_dir = clash_service_ipc::prepare_service_install_directory()?;
     let target = install_dir.join("clash-service.exe");
     let staged = stage_service_binary(&source, &target)?;
 
@@ -452,8 +447,8 @@ fn main() -> anyhow::Result<()> {
         ServiceStartType::AutoStart
     };
     let service_info = ServiceInfo {
-        name: OsString::from(clash_verge_service_ipc::WINDOWS_SERVICE_NAME),
-        display_name: OsString::from(clash_verge_service_ipc::SERVICE_DISPLAY_NAME),
+        name: OsString::from(clash_service_ipc::WINDOWS_SERVICE_NAME),
+        display_name: OsString::from(clash_service_ipc::SERVICE_DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
         start_type,
         error_control: ServiceErrorControl::Normal,
@@ -468,10 +463,7 @@ fn main() -> anyhow::Result<()> {
         | ServiceAccess::START
         | ServiceAccess::STOP
         | ServiceAccess::CHANGE_CONFIG;
-    match service_manager.open_service(
-        clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
-        service_access,
-    ) {
+    match service_manager.open_service(clash_service_ipc::WINDOWS_SERVICE_NAME, service_access) {
         Ok(service) => {
             const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
             let status = service.query_status()?;
@@ -511,7 +503,7 @@ fn main() -> anyhow::Result<()> {
     let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let service = service_manager.create_service(&service_info, start_access)?;
 
-    service.set_description("Clash Verge Service helps to launch Clash Core")?;
+    service.set_description("Clash Service helps to launch Clash Core")?;
     configure_windows_service_recovery(&service)?;
     service.start(&Vec::<&OsStr>::new())?;
     wait_for_service_ready()?;
@@ -618,7 +610,7 @@ mod tests {
     fn missing_launchd_service_skips_bootout() {
         let plan = classify_launchd_service_probe(
             Some(113),
-            "Could not find service \"io.github.clash-verge-rev.clash-verge-rev.service\" in domain for system",
+            "Could not find service \"io.github.keeplearning2026.clash.service\" in domain for system",
         )
         .unwrap();
 

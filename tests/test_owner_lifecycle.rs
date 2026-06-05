@@ -4,8 +4,8 @@ mod common;
 
 use anyhow::{Context as _, Result};
 #[cfg(windows)]
-use clash_verge_service_ipc::service_paths;
-use clash_verge_service_ipc::{
+use clash_service_ipc::service_paths;
+use clash_service_ipc::{
     IpcCommand, OwnerCredentials, OwnerSessionProof, RuntimeBundle, ServiceErrorCode,
     ServiceStatusSnapshot, StartClashRequest, StartClashResult, connect,
     get_status as client_get_status, load_active_owner, load_owner_desired_state, owner_key,
@@ -13,7 +13,7 @@ use clash_verge_service_ipc::{
     stop_ipc_server,
 };
 #[cfg(unix)]
-use clash_verge_service_ipc::{
+use clash_service_ipc::{
     MacosProxyConfig, ProxyApplyOutcome, WriterConfig,
     get_clash_log_snapshot as client_get_clash_log_snapshot,
     get_clash_logs as client_get_clash_logs, restore_desired_state,
@@ -44,10 +44,10 @@ fn test_bin_path(name: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn owner_credentials_for_uid(name: &str, uid: u32) -> clash_verge_service_ipc::OwnerCredentials {
+fn owner_credentials_for_uid(name: &str, uid: u32) -> clash_service_ipc::OwnerCredentials {
     let app_data_dir =
         std::env::temp_dir().join(format!("service-ipc-owner-{}-{name}", std::process::id()));
-    clash_verge_service_ipc::test_owner_credentials_for_uid(&app_data_dir, uid)
+    clash_service_ipc::test_owner_credentials_for_uid(&app_data_dir, uid)
         .expect("synthetic test owner credentials should be valid")
 }
 

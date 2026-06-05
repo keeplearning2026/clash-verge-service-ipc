@@ -3,7 +3,7 @@ mod common;
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use clash_verge_service_ipc::{
+    use clash_service_ipc::{
         OwnerSessionProof, RuntimeBundle, StartClashRequest, connect, get_status,
         load_owner_desired_state, owner_key, run_ipc_server, start_clash, stop_clash,
         stop_ipc_server,

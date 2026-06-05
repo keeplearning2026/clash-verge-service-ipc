@@ -3,7 +3,7 @@
 mod common;
 
 use anyhow::{Context as _, Result};
-use clash_verge_service_ipc::{
+use clash_service_ipc::{
     AuthenticatedRequest, IpcCommand, MacosProxyConfig, OwnerSessionProof, RuntimeBundle,
     ServiceErrorCode, StartClashRequest, StartClashResult, connect, run_ipc_server,
     set_system_proxy, start_clash, stop_clash, stop_ipc_server,
@@ -144,11 +144,11 @@ async fn owner_b_cannot_overtake_owner_a_proxy_operation() -> Result<()> {
     let server_handle = run_ipc_server().await?;
     wait_for_ipc().await?;
 
-    let owner_a = clash_verge_service_ipc::test_owner_credentials_for_uid(
+    let owner_a = clash_service_ipc::test_owner_credentials_for_uid(
         &std::env::temp_dir().join(format!("service-ipc-proxy-race-{}-a", std::process::id())),
         97_001,
     )?;
-    let owner_b = clash_verge_service_ipc::test_owner_credentials_for_uid(
+    let owner_b = clash_service_ipc::test_owner_credentials_for_uid(
         &std::env::temp_dir().join(format!("service-ipc-proxy-race-{}-b", std::process::id())),
         97_002,
     )?;

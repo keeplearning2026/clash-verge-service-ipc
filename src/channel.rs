@@ -11,21 +11,21 @@ pub struct ChannelIdentity {
 #[cfg(not(feature = "development-channel"))]
 pub const CHANNEL_IDENTITY: ChannelIdentity = ChannelIdentity {
     id: "production",
-    service_slug: "clash-verge-service",
-    windows_service_name: "clash_verge_service",
-    service_display_name: "Clash Verge Service",
-    macos_app_bundle_id: "io.github.clash-verge-rev.clash-verge-rev",
-    macos_service_id: "io.github.clash-verge-rev.clash-verge-rev.service",
+    service_slug: "clash-service",
+    windows_service_name: "clash_service",
+    service_display_name: "Clash Service",
+    macos_app_bundle_id: "io.github.keeplearning2026.clash",
+    macos_service_id: "io.github.keeplearning2026.clash.service",
 };
 
 #[cfg(feature = "development-channel")]
 pub const CHANNEL_IDENTITY: ChannelIdentity = ChannelIdentity {
     id: "development",
-    service_slug: "clash-verge-service-dev",
-    windows_service_name: "clash_verge_service_dev",
-    service_display_name: "Clash Verge Development Service",
-    macos_app_bundle_id: "io.github.clash-verge-rev.clash-verge-rev.dev",
-    macos_service_id: "io.github.clash-verge-rev.clash-verge-rev.dev.service",
+    service_slug: "clash-service-dev",
+    windows_service_name: "clash_service_dev",
+    service_display_name: "Clash Development Service",
+    macos_app_bundle_id: "io.github.keeplearning2026.clash.dev",
+    macos_service_id: "io.github.keeplearning2026.clash.dev.service",
 };
 
 pub const SERVICE_SLUG: &str = CHANNEL_IDENTITY.service_slug;
@@ -41,15 +41,11 @@ mod tests {
     #[test]
     fn compiled_channel_has_a_self_consistent_identity() {
         assert!(!CHANNEL_IDENTITY.id.is_empty());
-        assert!(
-            CHANNEL_IDENTITY
-                .service_slug
-                .starts_with("clash-verge-service")
-        );
+        assert!(CHANNEL_IDENTITY.service_slug.starts_with("clash-service"));
         assert!(
             CHANNEL_IDENTITY
                 .windows_service_name
-                .starts_with("clash_verge_service")
+                .starts_with("clash_service")
         );
         assert!(
             CHANNEL_IDENTITY

@@ -1,6 +1,6 @@
 use std::sync::Once;
 
-use clash_verge_service_ipc::{OwnerCredentials, test_owner_credentials};
+use clash_service_ipc::{OwnerCredentials, test_owner_credentials};
 
 static INIT_TRACING: Once = Once::new();
 

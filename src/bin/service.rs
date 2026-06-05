@@ -1,10 +1,10 @@
-//! Clash Verge Service - Cross-platform IPC service daemon
+//! Clash Service - Cross-platform IPC service daemon
 //!
 //! This service can run as a standalone process or as a Windows service.
 //! It listens for shutdown signals (Ctrl+C, SIGTERM, or service stop) to gracefully terminate.
 
 use anyhow::Result;
-use clash_verge_service_ipc::{
+use clash_service_ipc::{
     acquire_service_owner, reconcile_service_startup, restore_desired_state,
     run_ipc_supervisor_until_shutdown,
 };
@@ -49,11 +49,7 @@ fn set_secure_process_umask() {
 #[cfg(windows)]
 fn main() -> Result<()> {
     init_logger();
-    if service_dispatcher::start(
-        clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
-        ffi_service_main,
-    )
-    .is_err()
+    if service_dispatcher::start(clash_service_ipc::WINDOWS_SERVICE_NAME, ffi_service_main).is_err()
     {
         info!("Not running as a service, starting in standalone mode.");
         let rt = tokio::runtime::Runtime::new()?;
@@ -91,10 +87,8 @@ fn run_service() -> platform_lib::Result<()> {
         }
     };
 
-    let status_handle = service_control_handler::register(
-        clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
-        event_handler,
-    )?;
+    let status_handle =
+        service_control_handler::register(clash_service_ipc::WINDOWS_SERVICE_NAME, event_handler)?;
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -180,7 +174,7 @@ fn init_logger() {
 
 async fn run_standalone() -> Result<()> {
     let pid = std::process::id();
-    info!("Clash Verge Service - Standalone Mode");
+    info!("Clash Service - Standalone Mode");
     info!("Current process PID: {}", pid);
 
     let Some(_owner_guard) = acquire_service_owner().await? else {

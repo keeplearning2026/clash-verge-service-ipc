@@ -1,13 +1,13 @@
 #![cfg(feature = "client")]
 
 #[cfg(feature = "test")]
-use clash_verge_service_ipc::test_owner_credentials;
-use clash_verge_service_ipc::{
+use clash_service_ipc::test_owner_credentials;
+use clash_service_ipc::{
     IpcConfig, MIN_REQUIRED_SERVICE_REVISION, OwnerSessionProof, ProtocolVersion, RuntimeBundle,
     StartClashRequest, get_status, get_version, set_config, start_clash, stop_clash,
 };
 #[cfg(not(feature = "test"))]
-use clash_verge_service_ipc::{OwnerCredentials, OwnerIdentity};
+use clash_service_ipc::{OwnerCredentials, OwnerIdentity};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -131,12 +131,12 @@ async fn stop_flow() -> anyhow::Result<()> {
 }
 
 fn session_token() -> anyhow::Result<String> {
-    Ok(std::env::var("CLASH_VERGE_TEST_SESSION_TOKEN")?)
+    Ok(std::env::var("CLASH_SERVICE_TEST_SESSION_TOKEN")?)
 }
 
 fn session_proof() -> anyhow::Result<OwnerSessionProof> {
     Ok(OwnerSessionProof {
-        generation: std::env::var("CLASH_VERGE_TEST_SESSION_GENERATION")?.parse()?,
+        generation: std::env::var("CLASH_SERVICE_TEST_SESSION_GENERATION")?.parse()?,
         token: session_token()?,
     })
 }
@@ -169,7 +169,7 @@ async fn wait_ipc_ready() -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "test")]
-fn owner_credentials() -> anyhow::Result<clash_verge_service_ipc::OwnerCredentials> {
+fn owner_credentials() -> anyhow::Result<clash_service_ipc::OwnerCredentials> {
     test_owner_credentials(&std::env::current_dir()?)
 }
 
@@ -183,13 +183,13 @@ fn owner_credentials() -> anyhow::Result<OwnerCredentials> {
     };
     #[cfg(windows)]
     let identity = OwnerIdentity::Windows {
-        sid: std::env::var("CLASH_VERGE_TEST_OWNER_SID")?,
+        sid: std::env::var("CLASH_SERVICE_TEST_OWNER_SID")?,
     };
 
     Ok(OwnerCredentials {
         identity,
         app_data_dir: app_data_dir.to_string_lossy().into_owned(),
-        token: std::env::var("CLASH_VERGE_TEST_OWNER_TOKEN").ok(),
+        token: std::env::var("CLASH_SERVICE_TEST_OWNER_TOKEN").ok(),
     })
 }
 

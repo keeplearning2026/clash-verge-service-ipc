@@ -1,6 +1,6 @@
-OutFile "ClashVergeServiceInstaller.exe"
+OutFile "ClashServiceInstaller.exe"
 
-InstallDir "$PROGRAMFILES\ClashVergeService"
+InstallDir "$PROGRAMFILES\ClashService"
 
 Page directory
 Page instfiles
