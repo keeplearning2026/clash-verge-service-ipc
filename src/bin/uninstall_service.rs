@@ -123,7 +123,7 @@ fn main() -> Result<(), Error> {
     // Reload systemd
     let _ = run_command("systemctl", &["daemon-reload"], debug);
     let target =
-        clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service");
+        clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-service");
     if target.exists() {
         std::fs::remove_file(&target).map_err(|error| {
             anyhow::anyhow!("Failed to remove service binary {target:?}: {error}")
@@ -202,7 +202,7 @@ fn main() -> anyhow::Result<()> {
         "timed out waiting for service deletion",
     )?;
     let target = clash_verge_service_ipc::prepare_service_install_directory()?
-        .join("clash-verge-service.exe");
+        .join("clash-service.exe");
     if target.exists() {
         std::fs::remove_file(&target).map_err(|error| {
             anyhow::anyhow!("Failed to remove service binary {target:?}: {error}")

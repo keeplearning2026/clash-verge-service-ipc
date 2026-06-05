@@ -25,9 +25,9 @@ fn enter_repair_gate() -> Result<clash_verge_service_ipc::ServiceRepairGate, Err
 
 fn bundled_service_binary() -> Result<PathBuf, Error> {
     let source = std::env::current_exe()?.with_file_name(if cfg!(windows) {
-        "clash-verge-service.exe"
+        "clash-service.exe"
     } else {
-        "clash-verge-service"
+        "clash-service"
     });
     let metadata = std::fs::symlink_metadata(&source)
         .with_context(|| format!("failed to inspect bundled service binary {source:?}"))?;
@@ -306,7 +306,7 @@ fn main() -> Result<(), Error> {
         .map_err(|e| anyhow::anyhow!("Failed to create bundle directories: {}", e))?;
 
     // 复制二进制文件到 bundle 的 MacOS 目录
-    let target_binary_path = macos_path.join("clash-verge-service");
+    let target_binary_path = macos_path.join("clash-service");
     let staged = stage_service_binary(&service_binary_path, &target_binary_path)?;
 
     // 创建并写入 Info.plist
@@ -389,7 +389,7 @@ fn main() -> Result<(), Error> {
     let debug = std::env::args().any(|arg| arg == "--debug");
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
-    let target = install_dir.join("clash-verge-service");
+    let target = install_dir.join("clash-service");
     let staged = stage_service_binary(&source, &target)?;
     let unit_name = format!("{}.service", clash_verge_service_ipc::SERVICE_SLUG);
     let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
@@ -441,7 +441,7 @@ fn main() -> anyhow::Result<()> {
     let _gate = enter_repair_gate()?;
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
-    let target = install_dir.join("clash-verge-service.exe");
+    let target = install_dir.join("clash-service.exe");
     let staged = stage_service_binary(&source, &target)?;
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
