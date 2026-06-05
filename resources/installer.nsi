@@ -12,7 +12,7 @@ Section "Install"
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-    ExecShell "" "$INSTDIR\clash-verge-service-install.exe"
+    ExecShell "" "$INSTDIR\clash-service-install.exe"
 SectionEnd
 
 Section "Uninstall"
