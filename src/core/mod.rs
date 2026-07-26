@@ -57,6 +57,8 @@ mod unix_security;
 mod windows_legacy_cleanup;
 #[cfg(all(feature = "standalone", windows))]
 mod windows_security;
+#[cfg(all(feature = "standalone", windows))]
+mod windows_service;
 
 #[cfg(feature = "standalone")]
 pub use desired::{
@@ -85,3 +87,5 @@ pub use state::{service_lifecycle_state, set_service_lifecycle_state};
 pub use test_credentials::test_owner_credentials;
 #[cfg(all(feature = "test", unix))]
 pub use test_credentials::test_owner_credentials_for_uid;
+#[cfg(all(feature = "standalone", windows))]
+pub use windows_service::{purge_windows_service_state, remove_windows_service_if_exists};

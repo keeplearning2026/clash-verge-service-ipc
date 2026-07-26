@@ -5,8 +5,9 @@ mod core;
 mod client;
 
 pub use channel::{
-    CHANNEL_IDENTITY, ChannelIdentity, MACOS_APP_BUNDLE_ID, MACOS_SERVICE_ID, SERVICE_DISPLAY_NAME,
-    SERVICE_SLUG, WINDOWS_SERVICE_NAME,
+    CHANNEL_IDENTITY, ChannelIdentity, LEGACY_SERVICE_SLUG, LEGACY_WINDOWS_SERVICE_NAME,
+    MACOS_APP_BUNDLE_ID, MACOS_SERVICE_ID, SERVICE_DISPLAY_NAME, SERVICE_SLUG,
+    WINDOWS_SERVICE_NAME,
 };
 pub use core::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, IpcCommand,
@@ -27,6 +28,8 @@ pub use core::{
     run_ipc_server, run_ipc_supervisor_until_shutdown, service_lifecycle_state,
     set_service_lifecycle_state, stop_ipc_server,
 };
+#[cfg(all(feature = "standalone", windows))]
+pub use core::{purge_windows_service_state, remove_windows_service_if_exists};
 
 #[cfg(feature = "test")]
 pub use core::test_owner_credentials;

@@ -194,7 +194,7 @@ fn wait_for_service_ready() -> Result<(), Error> {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn launchd_service_target() -> String {
     format!("system/{}", clash_service_ipc::MACOS_SERVICE_ID)
 }
@@ -434,6 +434,10 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let _gate = enter_repair_gate()?;
+    clash_service_ipc::remove_windows_service_if_exists(
+        clash_service_ipc::LEGACY_WINDOWS_SERVICE_NAME,
+    )
+    .context("failed to remove the legacy Windows service before migration")?;
     let source = bundled_service_binary()?;
     let install_dir = clash_service_ipc::prepare_service_install_directory()?;
     let target = install_dir.join("clash-service.exe");

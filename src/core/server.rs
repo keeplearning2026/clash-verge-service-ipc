@@ -55,6 +55,8 @@ trait OwnerProxyTransition {
     async fn start_new_core(&mut self) -> AnyResult<()>;
     async fn commit_new_owner(&mut self) -> AnyResult<ActiveOwnerState>;
     async fn apply_new_proxy(&mut self) -> AnyResult<crate::ProxyApplyOutcome>;
+    async fn finalize_new_owner(&mut self) -> AnyResult<()>;
+    async fn rollback_new_owner(&mut self) -> AnyResult<()>;
 }
 
 async fn owner_proxy_transition(
@@ -82,8 +84,21 @@ async fn owner_proxy_transition(
     let active = transition.commit_new_owner().await.map_err(|error| {
         ServiceError::owner_switch_failed(format!("Failed to commit owner state: {error:#}"))
     })?;
-    let proxy_outcome = transition.apply_new_proxy().await.map_err(|error| {
-        ServiceError::proxy_apply_failed(format!("Failed to apply owner proxy: {error:#}"))
+    let proxy_outcome = match transition.apply_new_proxy().await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let rollback = transition.rollback_new_owner().await;
+            let message = match rollback {
+                Ok(()) => format!("Failed to apply owner proxy: {error:#}"),
+                Err(rollback_error) => format!(
+                    "Failed to apply owner proxy: {error:#}; failed to roll back the new owner: {rollback_error:#}"
+                ),
+            };
+            return Err(ServiceError::proxy_apply_failed(message));
+        }
+    };
+    transition.finalize_new_owner().await.map_err(|error| {
+        ServiceError::owner_switch_failed(format!("Failed to finalize owner runtime: {error:#}"))
     })?;
     Ok((active, proxy_outcome))
 }
@@ -163,19 +178,57 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
             return self.rollback_commit_failure(error).await;
         }
         match commit_active_owner_session(self.owner, self.proposed_session_token).await {
-            Ok(active) => {
-                self.prepared_runtime
-                    .take()
-                    .context("prepared runtime disappeared during owner commit")?
-                    .commit();
-                Ok(active)
-            }
+            Ok(active) => Ok(active),
             Err(error) => self.rollback_commit_failure(error).await,
         }
     }
 
     async fn apply_new_proxy(&mut self) -> AnyResult<ProxyApplyOutcome> {
         apply_service_proxy_or_direct(self.macos_proxy).await
+    }
+
+    async fn finalize_new_owner(&mut self) -> AnyResult<()> {
+        self.prepared_runtime
+            .take()
+            .context("prepared runtime disappeared during owner finalization")?
+            .commit();
+        Ok(())
+    }
+
+    async fn rollback_new_owner(&mut self) -> AnyResult<()> {
+        let proxy_result = restore_direct_proxy().await;
+        let owner_result = rollback_started_owner(self.owner).await;
+        let runtime_result = if owner_result.is_ok() {
+            match self.prepared_runtime.take() {
+                Some(prepared_runtime) => prepared_runtime
+                    .discard_after_core_stopped()
+                    .await
+                    .map_err(anyhow::Error::new),
+                None => Err(anyhow!(
+                    "prepared runtime disappeared during owner rollback"
+                )),
+            }
+        } else {
+            Ok(())
+        };
+
+        match (proxy_result, owner_result, runtime_result) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (proxy, owner, runtime) => {
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                let mut failures = Vec::new();
+                if let Err(error) = proxy {
+                    failures.push(format!("proxy cleanup failed: {error:#}"));
+                }
+                if let Err(error) = owner {
+                    failures.push(format!("owner rollback failed: {error:#}"));
+                }
+                if let Err(error) = runtime {
+                    failures.push(format!("runtime cleanup failed: {error:#}"));
+                }
+                Err(anyhow!(failures.join("; ")))
+            }
+        }
     }
 }
 
@@ -273,6 +326,17 @@ async fn clear_proxy_with_direct_compensation() -> std::result::Result<(), Servi
         ),
     };
     Err(ServiceError::proxy_clear_failed(message))
+}
+
+async fn restore_direct_proxy() -> AnyResult<()> {
+    let Err(clear_error) = clear_service_proxy().await else {
+        return Ok(());
+    };
+    compensate_service_proxy().await.map_err(|compensation_error| {
+        anyhow!(
+            "failed to clear the rejected owner's proxy: {clear_error:#}; direct compensation failed: {compensation_error:#}"
+        )
+    })
 }
 
 async fn rollback_started_owner(owner: &AuthenticatedOwner) -> AnyResult<()> {
@@ -1064,12 +1128,16 @@ mod owner_lifecycle_tests {
 
     struct RecordingTransition {
         events: Vec<&'static str>,
+        previous_owner: ActiveOwnerState,
         active_owner: ActiveOwnerState,
         running_pid: u32,
         next_owner: ActiveOwnerState,
         clear_fails: bool,
         stop_fails: bool,
         apply_falls_back: bool,
+        apply_fails: bool,
+        rollback_fails: bool,
+        runtime_finalized: bool,
     }
 
     impl OwnerProxyTransition for RecordingTransition {
@@ -1109,6 +1177,9 @@ mod owner_lifecycle_tests {
 
         async fn apply_new_proxy(&mut self) -> anyhow::Result<ProxyApplyOutcome> {
             self.events.push("apply_b");
+            if self.apply_fails {
+                anyhow::bail!("apply and direct compensation failed");
+            }
             if self.apply_falls_back {
                 self.events.push("compensate_direct");
                 return Ok(ProxyApplyOutcome::DirectFallback {
@@ -1117,17 +1188,39 @@ mod owner_lifecycle_tests {
             }
             Ok(ProxyApplyOutcome::Applied)
         }
+
+        async fn finalize_new_owner(&mut self) -> anyhow::Result<()> {
+            self.events.push("finalize_b");
+            self.runtime_finalized = true;
+            Ok(())
+        }
+
+        async fn rollback_new_owner(&mut self) -> anyhow::Result<()> {
+            self.events.push("rollback_b");
+            if self.rollback_fails {
+                anyhow::bail!("rollback failed");
+            }
+            self.active_owner = self.previous_owner.clone();
+            self.running_pid = 0;
+            self.runtime_finalized = false;
+            Ok(())
+        }
     }
 
     fn recording_transition() -> RecordingTransition {
+        let previous_owner = ActiveOwnerState::from(&owner(96_001));
         RecordingTransition {
             events: Vec::new(),
-            active_owner: ActiveOwnerState::from(&owner(96_001)),
+            previous_owner: previous_owner.clone(),
+            active_owner: previous_owner,
             running_pid: 101,
             next_owner: ActiveOwnerState::from(&owner(96_002)),
             clear_fails: false,
             stop_fails: false,
             apply_falls_back: false,
+            apply_fails: false,
+            rollback_fails: false,
+            runtime_finalized: false,
         }
     }
 
@@ -1139,10 +1232,18 @@ mod owner_lifecycle_tests {
 
         assert_eq!(
             transition.events,
-            ["clear_proxy", "stop_a", "start_b", "commit_b", "apply_b"]
+            [
+                "clear_proxy",
+                "stop_a",
+                "start_b",
+                "commit_b",
+                "apply_b",
+                "finalize_b"
+            ]
         );
         assert_eq!(transition.active_owner.owner_key, "96002");
         assert_eq!(transition.running_pid, 202);
+        assert!(transition.runtime_finalized);
         assert_eq!(outcome, ProxyApplyOutcome::Applied);
         Ok(())
     }
@@ -1178,7 +1279,8 @@ mod owner_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn owner_proxy_transition_apply_failure_keeps_new_owner_and_core() -> anyhow::Result<()> {
+    async fn owner_proxy_transition_direct_fallback_keeps_new_owner_and_core() -> anyhow::Result<()>
+    {
         let mut transition = recording_transition();
         transition.apply_falls_back = true;
 
@@ -1187,6 +1289,7 @@ mod owner_lifecycle_tests {
         assert_eq!(active.owner_key, "96002");
         assert_eq!(transition.active_owner.owner_key, "96002");
         assert_eq!(transition.running_pid, 202);
+        assert!(transition.runtime_finalized);
         assert_eq!(
             outcome,
             ProxyApplyOutcome::DirectFallback {
@@ -1194,6 +1297,55 @@ mod owner_lifecycle_tests {
             }
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_proxy_transition_double_proxy_failure_rolls_back_new_owner() {
+        let mut transition = recording_transition();
+        transition.apply_fails = true;
+
+        let error = owner_proxy_transition(&mut transition)
+            .await
+            .expect_err("proxy apply and direct compensation failure must roll back");
+
+        assert_eq!(error.code, ServiceErrorCode::ProxyApplyFailed);
+        assert_eq!(
+            transition.events,
+            [
+                "clear_proxy",
+                "stop_a",
+                "start_b",
+                "commit_b",
+                "apply_b",
+                "rollback_b"
+            ]
+        );
+        assert_eq!(transition.active_owner.owner_key, "96001");
+        assert_eq!(transition.running_pid, 0);
+        assert!(!transition.runtime_finalized);
+    }
+
+    #[tokio::test]
+    async fn owner_proxy_transition_reports_proxy_and_rollback_failures() {
+        let mut transition = recording_transition();
+        transition.apply_fails = true;
+        transition.rollback_fails = true;
+
+        let error = owner_proxy_transition(&mut transition)
+            .await
+            .expect_err("rollback failure must be returned with the proxy failure");
+
+        assert_eq!(error.code, ServiceErrorCode::ProxyApplyFailed);
+        assert!(
+            error
+                .message
+                .contains("apply and direct compensation failed")
+        );
+        assert!(error.message.contains("failed to roll back the new owner"));
+        assert!(error.message.contains("rollback failed"));
+        assert_eq!(transition.active_owner.owner_key, "96002");
+        assert_eq!(transition.running_pid, 202);
+        assert!(!transition.runtime_finalized);
     }
 
     #[test]

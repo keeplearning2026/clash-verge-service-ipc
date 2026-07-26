@@ -3,12 +3,18 @@ use crate::core::paths::ensure_owner_state_directory;
 use crate::{
     ClashConfig, CoreConfig, RuntimeBundle, ServiceErrorCode, WriterConfig, mihomo_ipc_path,
 };
+use std::collections::HashSet;
+use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 static RUNTIME_GENERATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_RUNTIME_YAML_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RUNTIME_ASSETS: usize = 512;
+const MAX_RUNTIME_ASSET_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_RUNTIME_TOTAL_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(windows)]
 const WINDOWS_RUNTIME_RETRY_DELAYS: [Duration; 6] = [
@@ -316,20 +322,74 @@ async fn materialize_runtime(
     core_path: &Path,
     runtime: &Path,
 ) -> Result<(), ServiceError> {
+    if bundle.yaml.len() > MAX_RUNTIME_YAML_BYTES {
+        return Err(invalid_asset(format!(
+            "runtime YAML exceeds the {MAX_RUNTIME_YAML_BYTES}-byte limit"
+        )));
+    }
+    if bundle.assets.len() > MAX_RUNTIME_ASSETS {
+        return Err(invalid_asset(format!(
+            "runtime asset count exceeds the {MAX_RUNTIME_ASSETS}-asset limit"
+        )));
+    }
+
     set_private_directory_permissions(runtime).await?;
 
     let app_bundle_root = application_bundle_root(core_path);
+    let mut destinations = HashSet::with_capacity(bundle.assets.len());
+    let mut total_asset_bytes = 0_u64;
     for asset in &bundle.assets {
-        let source = validate_source(owner, app_bundle_root.as_deref(), &asset.source)?;
         let destination = validate_destination(&asset.destination)?;
+        if !destinations.insert(destination_key(&destination)) {
+            return Err(invalid_asset(format!(
+                "runtime asset destination is duplicated: {:?}",
+                asset.destination
+            )));
+        }
+        let source = open_verified_source(owner, app_bundle_root.as_deref(), &asset.source)?;
+        total_asset_bytes =
+            checked_total_asset_bytes(total_asset_bytes, source.length).map_err(|message| {
+                invalid_asset(format!("runtime asset {:?}: {message}", source.path))
+            })?;
+
         let target = runtime.join(destination);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 invalid_asset(format!("failed to create runtime asset directory: {error}"))
             })?;
         }
-        tokio::fs::copy(&source, &target).await.map_err(|error| {
-            invalid_asset(format!("failed to copy runtime asset {source:?}: {error}"))
+        let remaining_total =
+            MAX_RUNTIME_TOTAL_ASSET_BYTES.saturating_sub(total_asset_bytes - source.length);
+        let copy_limit = (MAX_RUNTIME_ASSET_BYTES + 1).min(remaining_total + 1);
+        let mut source_file = tokio::fs::File::from_std(source.file).take(copy_limit);
+        let mut target_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .await
+            .map_err(|error| {
+                invalid_asset(format!(
+                    "failed to create runtime asset target {target:?}: {error}"
+                ))
+            })?;
+        let copied = tokio::io::copy(&mut source_file, &mut target_file)
+            .await
+            .map_err(|error| {
+                invalid_asset(format!(
+                    "failed to copy runtime asset {:?}: {error}",
+                    source.path
+                ))
+            })?;
+        if copied != source.length {
+            return Err(invalid_asset(format!(
+                "runtime asset {:?} changed while it was being copied",
+                source.path
+            )));
+        }
+        target_file.sync_all().await.map_err(|error| {
+            invalid_asset(format!(
+                "failed to sync runtime asset target {target:?}: {error}"
+            ))
         })?;
     }
 
@@ -346,6 +406,27 @@ async fn materialize_runtime(
         .await
         .map_err(|error| invalid_asset(format!("failed to sync runtime config: {error}")))?;
     Ok(())
+}
+
+fn checked_total_asset_bytes(current: u64, next: u64) -> Result<u64, &'static str> {
+    if next > MAX_RUNTIME_ASSET_BYTES {
+        return Err("exceeds the per-file size limit");
+    }
+    current
+        .checked_add(next)
+        .filter(|total| *total <= MAX_RUNTIME_TOTAL_ASSET_BYTES)
+        .ok_or("exceeds the aggregate size limit")
+}
+
+fn destination_key(destination: &Path) -> String {
+    if cfg!(windows) {
+        destination
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase()
+    } else {
+        destination.to_string_lossy().into_owned()
+    }
 }
 
 fn validate_core_path(
@@ -382,11 +463,18 @@ fn validate_core_path(
     Ok(canonical)
 }
 
-fn validate_source(
+#[derive(Debug)]
+struct VerifiedSource {
+    file: File,
+    path: PathBuf,
+    length: u64,
+}
+
+fn open_verified_source(
     owner: &AuthenticatedOwner,
     app_bundle_root: Option<&Path>,
     source: &str,
-) -> Result<PathBuf, ServiceError> {
+) -> Result<VerifiedSource, ServiceError> {
     let requested = Path::new(source);
     let canonical = canonical_regular_file(requested, "runtime asset")?;
     if canonical != requested {
@@ -401,7 +489,153 @@ fn validate_source(
             "runtime asset is outside the authenticated application roots",
         ));
     }
-    Ok(canonical)
+
+    open_verified_regular_file(&canonical)
+}
+
+#[cfg(unix)]
+fn open_verified_regular_file(path: &Path) -> Result<VerifiedSource, ServiceError> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let expected = std::fs::metadata(path)
+        .map_err(|error| invalid_asset(format!("runtime asset is unavailable: {error}")))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(platform_lib::O_CLOEXEC | platform_lib::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            invalid_asset(format!(
+                "failed to open runtime asset without following symlinks: {error}"
+            ))
+        })?;
+    let opened = file.metadata().map_err(|error| {
+        invalid_asset(format!("failed to inspect opened runtime asset: {error}"))
+    })?;
+    if !opened.is_file() || opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err(invalid_asset(
+            "runtime asset changed between validation and open",
+        ));
+    }
+    let final_path = std::fs::canonicalize(path).map_err(|error| {
+        invalid_asset(format!("failed to resolve opened runtime asset: {error}"))
+    })?;
+    let final_metadata = std::fs::metadata(&final_path).map_err(|error| {
+        invalid_asset(format!("failed to inspect resolved runtime asset: {error}"))
+    })?;
+    if final_path != path
+        || opened.dev() != final_metadata.dev()
+        || opened.ino() != final_metadata.ino()
+    {
+        return Err(invalid_asset(
+            "opened runtime asset no longer resolves to the validated path",
+        ));
+    }
+    Ok(VerifiedSource {
+        file,
+        path: path.to_path_buf(),
+        length: opened.len(),
+    })
+}
+
+#[cfg(windows)]
+fn open_verified_regular_file(path: &Path) -> Result<VerifiedSource, ServiceError> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(invalid_asset("runtime asset path contains NUL"));
+    }
+    wide.push(0);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(invalid_asset(format!(
+            "failed to open runtime asset without following reparse points: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0
+        || unsafe { GetFileType(handle) } != FILE_TYPE_DISK
+        || information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(invalid_asset(
+            "opened runtime asset is not an ordinary disk file",
+        ));
+    }
+    let final_path = windows_final_path(handle)?;
+    if !windows_paths_equal(&final_path, path) {
+        return Err(invalid_asset(
+            "runtime asset changed between validation and open",
+        ));
+    }
+    Ok(VerifiedSource {
+        file,
+        path: path.to_path_buf(),
+        length: (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow),
+    })
+}
+
+#[cfg(windows)]
+fn windows_final_path(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<PathBuf, ServiceError> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let mut buffer = vec![0_u16; 512];
+    loop {
+        let length = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        } as usize;
+        if length == 0 {
+            return Err(invalid_asset(format!(
+                "failed to resolve opened runtime asset: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if length < buffer.len() {
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(
+                &buffer[..length],
+            )));
+        }
+        buffer.resize(length + 1, 0);
+    }
+}
+
+#[cfg(windows)]
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    fn normalized(path: &Path) -> String {
+        let value = path.to_string_lossy().replace('/', "\\");
+        let value = if let Some(tail) = value.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{tail}")
+        } else if let Some(tail) = value.strip_prefix(r"\\?\") {
+            tail.to_owned()
+        } else {
+            value
+        };
+        value.trim_end_matches('\\').to_lowercase()
+    }
+
+    normalized(left) == normalized(right)
 }
 
 fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf, ServiceError> {
@@ -589,12 +823,223 @@ mod runtime_gc_tests {
     }
 }
 
+#[cfg(test)]
+mod limit_tests {
+    use super::{
+        MAX_RUNTIME_ASSET_BYTES, MAX_RUNTIME_TOTAL_ASSET_BYTES, checked_total_asset_bytes,
+        destination_key,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn runtime_asset_size_limits_accept_boundaries_and_reject_overflow() {
+        assert_eq!(
+            checked_total_asset_bytes(0, MAX_RUNTIME_ASSET_BYTES),
+            Ok(MAX_RUNTIME_ASSET_BYTES)
+        );
+        assert_eq!(
+            checked_total_asset_bytes(
+                MAX_RUNTIME_TOTAL_ASSET_BYTES - MAX_RUNTIME_ASSET_BYTES,
+                MAX_RUNTIME_ASSET_BYTES
+            ),
+            Ok(MAX_RUNTIME_TOTAL_ASSET_BYTES)
+        );
+        assert!(checked_total_asset_bytes(0, MAX_RUNTIME_ASSET_BYTES + 1).is_err());
+        assert!(checked_total_asset_bytes(MAX_RUNTIME_TOTAL_ASSET_BYTES, 1).is_err());
+    }
+
+    #[test]
+    fn runtime_destination_identity_matches_platform_filesystem_rules() {
+        if cfg!(windows) {
+            assert_eq!(
+                destination_key(Path::new(r"providers\entry.yaml")),
+                destination_key(Path::new("providers/entry.yaml"))
+            );
+            assert_eq!(
+                destination_key(Path::new("Providers/Entry.yaml")),
+                destination_key(Path::new("providers/entry.yaml"))
+            );
+        } else {
+            assert_ne!(
+                destination_key(Path::new(r"providers\entry.yaml")),
+                destination_key(Path::new("providers/entry.yaml"))
+            );
+            assert_ne!(
+                destination_key(Path::new("Providers/Entry.yaml")),
+                destination_key(Path::new("providers/entry.yaml"))
+            );
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_asset_tests {
+    use super::{
+        MAX_RUNTIME_ASSETS, MAX_RUNTIME_YAML_BYTES, open_verified_regular_file, prepare_runtime,
+    };
+    use crate::core::auth::AuthenticatedOwner;
+    use crate::{OwnerIdentity, RuntimeAsset, RuntimeBundle, ServiceErrorCode, owner_key};
+    use serial_test::serial;
+    use std::io::Read as _;
+
+    #[test]
+    fn opened_runtime_asset_handle_survives_path_replacement_attempt() -> anyhow::Result<()> {
+        let app_root = std::env::temp_dir().join(format!(
+            "service-runtime-windows-handle-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&app_root);
+        std::fs::create_dir_all(&app_root)?;
+        let source = app_root.join("asset");
+        let displaced = app_root.join("asset.displaced");
+        std::fs::write(&source, b"verified bytes")?;
+        let canonical_source = std::fs::canonicalize(&source)?;
+
+        let mut verified = open_verified_regular_file(&canonical_source)?;
+        if std::fs::rename(&source, &displaced).is_ok() {
+            std::fs::write(&source, b"replacement bytes")?;
+        }
+        let mut bytes = Vec::new();
+        verified.file.read_to_end(&mut bytes)?;
+
+        assert_eq!(bytes, b"verified bytes");
+        drop(verified);
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn opening_runtime_asset_rejects_windows_reparse_points() -> anyhow::Result<()> {
+        use std::os::windows::fs::symlink_file;
+
+        let app_root = std::env::temp_dir().join(format!(
+            "service-runtime-windows-reparse-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&app_root);
+        std::fs::create_dir_all(&app_root)?;
+        let target = app_root.join("target");
+        let link = app_root.join("link");
+        std::fs::write(&target, b"target")?;
+        if let Err(error) = symlink_file(&target, &link) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                std::fs::remove_dir_all(app_root)?;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+
+        let error =
+            open_verified_regular_file(&link).expect_err("reparse-point asset must be rejected");
+
+        assert_eq!(error.code, ServiceErrorCode::InvalidRuntimeAsset);
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_limits_and_duplicate_destinations_leave_no_generation() -> anyhow::Result<()>
+    {
+        let app_root = std::env::temp_dir().join(format!(
+            "service-runtime-windows-limits-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&app_root);
+        std::fs::create_dir_all(&app_root)?;
+        std::fs::write(app_root.join("asset"), b"safe")?;
+        std::fs::write(app_root.join("mihomo.exe"), b"mock core")?;
+        let identity = OwnerIdentity::Windows {
+            sid: format!("S-1-5-21-1-2-3-{}", std::process::id()),
+        };
+        let owner = AuthenticatedOwner {
+            key: owner_key(&identity),
+            identity,
+            app_data_root: std::fs::canonicalize(&app_root)?,
+        };
+        let owner_root = crate::service_paths()
+            .for_owner(&owner.identity)
+            .root()
+            .to_path_buf();
+        let _ = std::fs::remove_dir_all(&owner_root);
+        let core_path = app_root.join("mihomo.exe").to_string_lossy().into_owned();
+        let valid = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![],
+            core_path: core_path.clone(),
+        };
+        let prepared = prepare_runtime(&owner, &valid).await?;
+        let source = std::fs::canonicalize(app_root.join("asset"))?
+            .to_string_lossy()
+            .into_owned();
+        let invalid_bundles = [
+            RuntimeBundle {
+                yaml: "x".repeat(MAX_RUNTIME_YAML_BYTES + 1),
+                assets: vec![],
+                core_path: core_path.clone(),
+            },
+            RuntimeBundle {
+                yaml: "mode: rule\n".to_string(),
+                assets: (0..=MAX_RUNTIME_ASSETS)
+                    .map(|index| RuntimeAsset {
+                        source: source.clone(),
+                        destination: format!("providers/{index}.yaml"),
+                    })
+                    .collect(),
+                core_path: core_path.clone(),
+            },
+            RuntimeBundle {
+                yaml: "mode: rule\n".to_string(),
+                assets: vec![
+                    RuntimeAsset {
+                        source: source.clone(),
+                        destination: "Providers/Duplicate.yaml".to_string(),
+                    },
+                    RuntimeAsset {
+                        source,
+                        destination: "providers/duplicate.yaml".to_string(),
+                    },
+                ],
+                core_path,
+            },
+        ];
+
+        for invalid in invalid_bundles {
+            let error = prepare_runtime(&owner, &invalid)
+                .await
+                .expect_err("invalid runtime bundle must be rejected");
+            assert_eq!(error.code, ServiceErrorCode::InvalidRuntimeAsset);
+        }
+        let generation_count = std::fs::read_dir(&owner_root)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("runtime.generation-")
+            })
+            .count();
+        assert_eq!(
+            generation_count, 1,
+            "rejected bundles left a partial runtime generation behind"
+        );
+
+        prepared.discard_after_core_stopped().await?;
+        std::fs::remove_dir_all(app_root)?;
+        let _ = std::fs::remove_dir_all(owner_root);
+        Ok(())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::prepare_runtime;
+    use super::{
+        MAX_RUNTIME_ASSETS, MAX_RUNTIME_YAML_BYTES, open_verified_regular_file, prepare_runtime,
+    };
     use crate::core::auth::AuthenticatedOwner;
     use crate::{OwnerIdentity, RuntimeAsset, RuntimeBundle, ServiceErrorCode};
     use serial_test::serial;
+    use std::io::Read as _;
 
     fn test_owner(app_data_root: std::path::PathBuf) -> AuthenticatedOwner {
         let uid = unsafe { platform_lib::geteuid() };
@@ -734,6 +1179,131 @@ mod tests {
         assert_eq!(
             generation_count, 1,
             "rejected runtime left a partial generation behind"
+        );
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn opened_runtime_asset_handle_is_stable_after_path_replacement() -> anyhow::Result<()> {
+        let app_root = std::env::temp_dir().join(format!(
+            "service-runtime-handle-race-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&app_root)?;
+        let source = app_root.join("asset");
+        let displaced = app_root.join("asset.displaced");
+        std::fs::write(&source, b"verified bytes")?;
+
+        let mut verified = open_verified_regular_file(&source)?;
+        std::fs::rename(&source, &displaced)?;
+        std::fs::write(&source, b"replacement bytes")?;
+        let mut bytes = Vec::new();
+        verified.file.read_to_end(&mut bytes)?;
+
+        assert_eq!(bytes, b"verified bytes");
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_runtime_asset_rejects_symlinks() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let app_root =
+            std::env::temp_dir().join(format!("service-runtime-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&app_root)?;
+        let target = app_root.join("target");
+        let link = app_root.join("link");
+        std::fs::write(&target, b"target")?;
+        symlink(&target, &link)?;
+
+        let error =
+            open_verified_regular_file(&link).expect_err("symlinked asset must be rejected");
+
+        assert_eq!(error.code, ServiceErrorCode::InvalidRuntimeAsset);
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_limits_and_duplicate_destinations_leave_no_generation() -> anyhow::Result<()>
+    {
+        let app_root =
+            std::env::temp_dir().join(format!("service-runtime-limits-{}", std::process::id()));
+        std::fs::create_dir_all(&app_root)?;
+        std::fs::write(app_root.join("asset"), b"safe")?;
+        std::fs::write(app_root.join("mihomo"), b"mock core")?;
+        let owner = test_owner(std::fs::canonicalize(&app_root)?);
+        let core_path = app_root.join("mihomo").to_string_lossy().into_owned();
+        let valid = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![],
+            core_path: core_path.clone(),
+        };
+        let prepared = prepare_runtime(&owner, &valid).await?;
+        let source = owner
+            .app_data_root
+            .join("asset")
+            .to_string_lossy()
+            .into_owned();
+        let invalid_bundles = [
+            RuntimeBundle {
+                yaml: "x".repeat(MAX_RUNTIME_YAML_BYTES + 1),
+                assets: vec![],
+                core_path: core_path.clone(),
+            },
+            RuntimeBundle {
+                yaml: "mode: rule\n".to_string(),
+                assets: (0..=MAX_RUNTIME_ASSETS)
+                    .map(|index| RuntimeAsset {
+                        source: source.clone(),
+                        destination: format!("providers/{index}.yaml"),
+                    })
+                    .collect(),
+                core_path: core_path.clone(),
+            },
+            RuntimeBundle {
+                yaml: "mode: rule\n".to_string(),
+                assets: vec![
+                    RuntimeAsset {
+                        source: source.clone(),
+                        destination: "providers/duplicate.yaml".to_string(),
+                    },
+                    RuntimeAsset {
+                        source,
+                        destination: "providers/duplicate.yaml".to_string(),
+                    },
+                ],
+                core_path,
+            },
+        ];
+
+        for invalid in invalid_bundles {
+            let error = prepare_runtime(&owner, &invalid)
+                .await
+                .expect_err("invalid runtime bundle must be rejected");
+            assert_eq!(error.code, ServiceErrorCode::InvalidRuntimeAsset);
+        }
+
+        let runtime_root = prepared
+            .runtime
+            .parent()
+            .expect("runtime generation must have an owner root");
+        let generation_count = std::fs::read_dir(runtime_root)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("runtime.generation-")
+            })
+            .count();
+        assert_eq!(
+            generation_count, 1,
+            "rejected bundles left a partial runtime generation behind"
         );
         std::fs::remove_dir_all(app_root)?;
         Ok(())

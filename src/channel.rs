@@ -34,6 +34,15 @@ pub const SERVICE_DISPLAY_NAME: &str = CHANNEL_IDENTITY.service_display_name;
 pub const MACOS_APP_BUNDLE_ID: &str = CHANNEL_IDENTITY.macos_app_bundle_id;
 pub const MACOS_SERVICE_ID: &str = CHANNEL_IDENTITY.macos_service_id;
 
+#[cfg(not(feature = "development-channel"))]
+pub const LEGACY_SERVICE_SLUG: &str = "clash-verge-service";
+#[cfg(feature = "development-channel")]
+pub const LEGACY_SERVICE_SLUG: &str = "clash-verge-service-dev";
+#[cfg(not(feature = "development-channel"))]
+pub const LEGACY_WINDOWS_SERVICE_NAME: &str = "clash_verge_service";
+#[cfg(feature = "development-channel")]
+pub const LEGACY_WINDOWS_SERVICE_NAME: &str = "clash_verge_service_dev";
+
 #[cfg(test)]
 mod tests {
     use super::CHANNEL_IDENTITY;

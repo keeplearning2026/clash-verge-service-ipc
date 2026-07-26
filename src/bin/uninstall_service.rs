@@ -24,7 +24,7 @@ fn run_maintenance_if_requested() -> Result<bool, Error> {
     Ok(true)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn poll_until<T>(
     max_attempts: usize,
     mut probe: impl FnMut() -> Result<Option<T>, Error>,
@@ -135,76 +135,20 @@ fn main() -> Result<(), Error> {
 /// stop and uninstall the service
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    use platform_lib::{
-        Error as WindowsServiceError,
-        service::{ServiceAccess, ServiceState},
-        service_manager::{ServiceManager, ServiceManagerAccess},
-    };
-    use std::{thread, time::Duration};
-
-    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-    const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
-    const POLL_ATTEMPTS: usize = 200;
-    const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-    fn has_raw_error(error: &WindowsServiceError, code: i32) -> bool {
-        matches!(error, WindowsServiceError::Winapi(error) if error.raw_os_error() == Some(code))
-    }
-
     if run_maintenance_if_requested()? {
         return Ok(());
     }
     let _gate = enter_repair_gate()?;
-    let manager_access = ServiceManagerAccess::CONNECT;
-    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
-
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service =
-        service_manager.open_service(clash_service_ipc::WINDOWS_SERVICE_NAME, service_access)?;
-
-    let service_status = service.query_status()?;
-    if service_status.current_state != ServiceState::Stopped {
-        if let Err(error) = service.stop()
-            && !has_raw_error(&error, ERROR_SERVICE_NOT_ACTIVE)
-        {
-            return Err(error.into());
-        }
-        poll_until(
-            POLL_ATTEMPTS,
-            || {
-                let status = service.query_status()?;
-                Ok((status.current_state == ServiceState::Stopped).then_some(()))
-            },
-            || thread::sleep(POLL_INTERVAL),
-            "timed out waiting for service to stop",
-        )?;
-    }
-
-    service.delete()?;
-    drop(service);
-    poll_until(
-        POLL_ATTEMPTS,
-        || match service_manager.open_service(
-            clash_service_ipc::WINDOWS_SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS,
-        ) {
-            Ok(service) => {
-                drop(service);
-                Ok(None)
-            }
-            Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => Ok(Some(())),
-            Err(error) => Err(error.into()),
-        },
-        || thread::sleep(POLL_INTERVAL),
-        "timed out waiting for service deletion",
+    clash_service_ipc::remove_windows_service_if_exists(clash_service_ipc::WINDOWS_SERVICE_NAME)?;
+    clash_service_ipc::remove_windows_service_if_exists(
+        clash_service_ipc::LEGACY_WINDOWS_SERVICE_NAME,
     )?;
-    let target = clash_service_ipc::prepare_service_install_directory()?.join("clash-service.exe");
-    if target.exists() {
-        std::fs::remove_file(&target).map_err(|error| {
-            anyhow::anyhow!("Failed to remove service binary {target:?}: {error}")
-        })?;
-    }
-    println!("Service uninstalled successfully. Resource cleanup warnings can be ignored.");
+    let removed = clash_service_ipc::purge_windows_service_state()?;
+    println!(
+        "Service uninstalled successfully; removed {} private state director{}.",
+        removed.len(),
+        if removed.len() == 1 { "y" } else { "ies" }
+    );
     Ok(())
 }
 
