@@ -12,6 +12,7 @@ const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
 const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
 const POLL_ATTEMPTS: usize = 200;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const OWNED_WINDOWS_STATE_DIRECTORIES: &[&str] = &[crate::SERVICE_SLUG];
 
 fn has_raw_error(error: &WindowsServiceError, code: i32) -> bool {
     matches!(error, WindowsServiceError::Winapi(error) if error.raw_os_error() == Some(code))
@@ -89,14 +90,15 @@ pub fn remove_windows_service_if_exists(service_name: &str) -> anyhow::Result<bo
     Ok(true)
 }
 
-/// Removes the current and legacy service-private ProgramData trees.
+/// Removes only this application's current service-private ProgramData tree.
 ///
 /// The exact roots are validated immediately before deletion. Reparse-point
 /// roots are rejected so an uninstall cannot be redirected outside ProgramData.
+/// Legacy service state is deliberately left to the user or its owning app.
 pub fn purge_windows_service_state() -> anyhow::Result<Vec<PathBuf>> {
     let program_data = windows_program_data().unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     let mut removed = Vec::new();
-    for directory_name in [crate::SERVICE_SLUG, crate::LEGACY_SERVICE_SLUG] {
+    for directory_name in OWNED_WINDOWS_STATE_DIRECTORIES {
         let target = program_data.join(directory_name);
         match validate_purge_target(&program_data, &target, directory_name)? {
             PurgeTarget::Missing => {}
@@ -182,7 +184,10 @@ fn windows_program_data() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PurgeTarget, remove_windows_service_if_exists, validate_purge_target};
+    use super::{
+        OWNED_WINDOWS_STATE_DIRECTORIES, PurgeTarget, remove_windows_service_if_exists,
+        validate_purge_target,
+    };
 
     #[test]
     fn removing_a_missing_service_is_idempotent() -> anyhow::Result<()> {
@@ -191,6 +196,12 @@ mod tests {
         assert!(!remove_windows_service_if_exists(&service_name)?);
         assert!(!remove_windows_service_if_exists(&service_name)?);
         Ok(())
+    }
+
+    #[test]
+    fn uninstall_owns_only_the_current_service_state_directory() {
+        assert_eq!(OWNED_WINDOWS_STATE_DIRECTORIES, &[crate::SERVICE_SLUG]);
+        assert!(!OWNED_WINDOWS_STATE_DIRECTORIES.contains(&crate::LEGACY_SERVICE_SLUG));
     }
 
     #[test]

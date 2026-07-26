@@ -140,9 +140,6 @@ fn main() -> anyhow::Result<()> {
     }
     let _gate = enter_repair_gate()?;
     clash_service_ipc::remove_windows_service_if_exists(clash_service_ipc::WINDOWS_SERVICE_NAME)?;
-    clash_service_ipc::remove_windows_service_if_exists(
-        clash_service_ipc::LEGACY_WINDOWS_SERVICE_NAME,
-    )?;
     let removed = clash_service_ipc::purge_windows_service_state()?;
     println!(
         "Service uninstalled successfully; removed {} private state director{}.",
